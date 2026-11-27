@@ -1,0 +1,12 @@
+{
+  "name": "camera-detector",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Find hidden camera lenses with your phone, even with the lights on.",
+  "type": "module",
+  "scripts": {
+    "start": "node tests/serve.cjs",
+    "test": "node --test tests/*.test.js",
+    "test:e2e": "node tests/e2e.cjs"
+  }
+}
