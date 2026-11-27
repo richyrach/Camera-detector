@@ -2,6 +2,8 @@
 
 Find hidden camera lenses with your phone, **even with the lights on**.
 
+**[⬇ Download the Android app (APK)](downloads/camera-detector.apk?raw=true)** · or use it in your browser at **https://richyrach.github.io/Camera-detector/** (once GitHub Pages is switched on, see below)
+
 Most hidden-camera finder apps ask you to turn the lights off and look for a glint by eye. This one doesn't need a dark room. It blinks your phone's flashlight and lets the camera do the looking.
 
 ## How it works
@@ -26,7 +28,7 @@ If the browser can't control the flashlight, the app falls back to **Spot scan**
 - Three views: **Normal**, **Red filter** (classic glint-spotting view) and **Glow map** (shows exactly what reacted to the flash)
 - Sensitivity slider, vibration and an optional beep on detection
 - **Snapshot** button saves or shares the current view with markers and a timestamp
-- Installable on your home screen, works offline, keeps the screen awake while scanning
+- **Android app** (APK) or a website you can add to your home screen; works offline and keeps the screen awake while scanning
 - **Private**: everything runs on the phone. No video is uploaded anywhere.
 - The flash blinks at no more than ~2.5 times a second, and blinking can be turned off in settings
 
@@ -40,14 +42,26 @@ If the browser can't control the flashlight, the app falls back to **Spot scan**
 
 The app checks what your browser supports and picks the right mode automatically.
 
-## Put it on your phone
+## Get it on your phone
 
-The camera only works on a secure (`https://`) page, so it needs to be hosted. The easiest free option is GitHub Pages:
+### Android app
 
-1. Merge this branch into `main`.
-2. In the repo on GitHub: **Settings → Pages → Build and deployment → Source: Deploy from a branch**, pick `main` and `/ (root)`, then **Save**.
-3. After a minute it's live at `https://<your-username>.github.io/Camera-detector/`.
-4. Open that link on your phone. To install it, use **Add to Home screen** (Chrome menu ⋮, or Safari's Share button).
+1. On your phone, download **[camera-detector.apk](downloads/camera-detector.apk?raw=true)**.
+2. Open it. Android will ask you to allow installs from your browser or Files app: allow it, then tap **Install**.
+3. Open **Camera Detector** and allow the camera when asked.
+
+Because the app isn't from the Play Store, Play Protect may warn that it doesn't recognise the developer. That's expected for apps you install yourself.
+
+Needs Android 10 or newer. Release 1.0.0, signing certificate SHA-256: `70:04:14:5a:99:e0:8c:35:50:bb:ab:d6:be:49:84:15:c3:e3:d0:76:01:85:e6:84:7e:87:22:f0:15:fe:79:57`.
+
+### Website (any phone)
+
+The camera only works on a secure (`https://`) page, so the website has to be hosted. GitHub Pages does that for free:
+
+1. In the repo on GitHub, go to **Settings → Pages**.
+2. Under **Build and deployment**, set **Source** to **Deploy from a branch**, pick the branch (`main` once this is merged) and the `/ (root)` folder, then **Save**.
+3. About a minute later it's live at **https://richyrach.github.io/Camera-detector/**. The site also links to the APK.
+4. Open it on your phone. To install it like an app, use **Add to Home screen** (Chrome menu ⋮, or Safari's Share button).
 
 Any static host works (Netlify, Vercel, Cloudflare Pages); there's no build step.
 
@@ -59,6 +73,28 @@ npm start          # serves the app at http://localhost:8080
 
 `localhost` counts as secure, so the camera works in a desktop browser there. A phone on the same Wi-Fi can't use the camera over plain `http://`, so use the hosted version for phones.
 
+## Build the Android app
+
+The app in `android/` is a small native wrapper that runs the same web app (copied in at build time) in Android's WebView. It passes camera permission through, saves snapshots to Photos, and makes the back button close the help sheet.
+
+You need JDK 17+ and the Android SDK (platform 35, build-tools 35). Then:
+
+```sh
+cd android
+./gradlew assembleRelease      # → app/build/outputs/apk/release/app-release.apk
+```
+
+To sign it, create `android/keystore.properties` (it's git-ignored, never commit it):
+
+```properties
+storeFile=/path/to/camera-detector-release.jks
+storePassword=...
+keyAlias=camera-detector
+keyPassword=...
+```
+
+Without that file the release APK is built unsigned. Updates must be signed with the same key as the installed version, or Android will refuse to install them over it. Bump `versionCode` and `versionName` in `android/app/build.gradle` for each release, then copy the APK to `downloads/camera-detector.apk`.
+
 ## Tests
 
 ```sh
@@ -66,7 +102,7 @@ npm test           # unit tests for the detection maths (Node 18+)
 npm run test:e2e   # full app in headless Chromium with a simulated camera + flashlight
 ```
 
-The end-to-end test fakes a phone camera showing a lit room with an always-on lamp and a small object hiding a lens that only glints while the app has the flashlight on, with simulated hand shake. It checks that Flash scan finds the lens, ignores the lamp and raises no false alarms, that Spot scan works without flashlight control, and that the flashlight is off after stopping. It uses Playwright (`npm i -D playwright` if it isn't installed).
+The end-to-end test fakes a phone camera showing a lit room with an always-on lamp and a small object hiding a lens that only glints while the app has the flashlight on, with simulated hand shake. It checks that Flash scan finds the lens, ignores the lamp and raises no false alarms, that Spot scan works without flashlight control, and that the flashlight is off after stopping. It also checks the Android app's hooks (native snapshot saving, back button, no "download the app" link inside the app). It uses Playwright (`npm i -D playwright` if it isn't installed).
 
 ## Project layout
 
@@ -79,6 +115,8 @@ sw.js                 offline cache
 manifest.webmanifest  home-screen install info
 icons/                app icons
 tests/                unit + end-to-end tests, local dev server
+android/              Android app (WebView wrapper around the web app)
+downloads/            the built APK
 ```
 
 ## Limits

@@ -162,6 +162,44 @@ async function run(browser, base, { torch, screenshot }) {
   return { mode, confirmed: confirmed.length };
 }
 
+/** The Android app shell: the page sees window.AndroidBridge. */
+async function runAndroidShell(browser, base) {
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  const page = await context.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.addInitScript(fakeCamera, { torch: true, lens: LENS, lamp: LAMP });
+  await page.addInitScript(() => {
+    window.__saved = [];
+    window.AndroidBridge = {
+      saveImage(base64, name) {
+        window.__saved.push({ bytes: base64.length, name });
+        return true;
+      },
+    };
+  });
+  await page.goto(base);
+  assert.equal(await page.isVisible('.intro .web-only'), false, 'APK link should be hidden inside the app');
+
+  await page.click('#intro-start');
+  await page.waitForFunction(() => window.__cameraDetector.snapshot().running, null, { timeout: 8000 });
+  await page.waitForTimeout(1500);
+  await page.click('#snap');
+  await page.waitForFunction(() => window.__saved.length === 1, null, { timeout: 5000 });
+  const saved = await page.evaluate(() => window.__saved[0]);
+  assert.match(saved.name, /^camera-scan-.*\.jpg$/);
+  assert.ok(saved.bytes > 10000, `snapshot too small: ${saved.bytes}`);
+  assert.match(await page.textContent('#toast'), /Saved to Photos/);
+
+  assert.equal(await page.evaluate(() => window.cameraDetectorBack()), false, 'back with nothing open leaves the app');
+  await page.click('#help-open');
+  assert.equal(await page.evaluate(() => window.cameraDetectorBack()), true, 'back closes the help sheet');
+  assert.equal(await page.isVisible('#help'), false);
+
+  assert.deepEqual(errors, [], 'page errors');
+  await context.close();
+}
+
 (async () => {
   const server = createServer();
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -178,6 +216,13 @@ async function run(browser, base, { torch, screenshot }) {
       failed = true;
       console.log(`not ok - ${label}\n  ${err.message}`);
     }
+  }
+  try {
+    await runAndroidShell(browser, base);
+    console.log('ok - android app shell (native snapshot save, back button, no APK link)');
+  } catch (err) {
+    failed = true;
+    console.log(`not ok - android app shell\n  ${err.message}`);
   }
   await browser.close();
   server.close();

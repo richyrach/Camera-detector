@@ -517,6 +517,12 @@ svg .fill {
   color: var(--muted);
 }
 
+.intro__fine a,
+.sheet__body a {
+  color: var(--accent);
+  font-weight: 600;
+}
+
 /* ── Help sheet ─────────────────────────────────────────────── */
 
 .sheet {

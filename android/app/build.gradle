@@ -1,0 +1,72 @@
+plugins {
+    id 'com.android.application'
+}
+
+// The app runs the same web app as the website. Copy it in at build time so
+// there is only ever one copy of it in the repo.
+def webRoot = rootProject.file('..')
+def webAssetsDir = layout.buildDirectory.dir('generated/web-assets').get().asFile
+def copyWebApp = tasks.register('copyWebApp', Sync) {
+    from(webRoot) {
+        include 'index.html', 'styles.css', 'js/**', 'icons/**'
+    }
+    into new File(webAssetsDir, 'www')
+}
+tasks.named('preBuild') { dependsOn copyWebApp }
+
+// Release signing: put the keystore details in android/keystore.properties
+// (storeFile, storePassword, keyAlias, keyPassword). Never commit that file.
+def keystoreProps = new Properties()
+def keystorePropsFile = rootProject.file('keystore.properties')
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+def canSign = keystoreProps.getProperty('storeFile') != null
+
+android {
+    namespace 'io.github.richyrach.cameradetector'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'io.github.richyrach.cameradetector'
+        minSdk 29
+        targetSdk 35
+        versionCode 1
+        versionName '1.0.0'
+    }
+
+    signingConfigs {
+        if (canSign) {
+            release {
+                storeFile rootProject.file(keystoreProps.getProperty('storeFile'))
+                storePassword keystoreProps.getProperty('storePassword')
+                keyAlias keystoreProps.getProperty('keyAlias')
+                keyPassword keystoreProps.getProperty('keyPassword')
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (canSign) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    sourceSets {
+        main.assets.srcDirs += webAssetsDir
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'androidx.webkit:webkit:1.14.0'
+}

@@ -37,6 +37,8 @@ const els = {
   toast: $('toast'),
 };
 const viewButtons = [...document.querySelectorAll('[data-view]')].filter((b) => b.tagName === 'BUTTON');
+/** Set when running inside the Android app (see android/…/MainActivity.java). */
+const android = window.AndroidBridge ?? null;
 
 const prefs = loadPrefs();
 const state = {
@@ -696,6 +698,11 @@ async function snapshot() {
     return;
   }
   const name = `camera-scan-${stamp.toISOString().slice(0, 19).replace(/[:T]/g, '-')}.jpg`;
+  if (android?.saveImage) {
+    const base64 = c.toDataURL('image/jpeg', 0.92).split(',')[1];
+    toast(android.saveImage(base64, name) ? 'Saved to Photos (Pictures/Camera Detector).' : "Couldn't save the snapshot.");
+    return;
+  }
   const file = new File([blob], name, { type: 'image/jpeg' });
   if (navigator.canShare?.({ files: [file] })) {
     try {
@@ -773,9 +780,12 @@ function updateCount() {
 }
 
 function showCameraError(err) {
+  const blocked = android
+    ? 'Camera access was blocked. Allow it in Android Settings → Apps → Camera Detector → Permissions, then tap Scan again.'
+    : 'Camera access was blocked. Allow the camera for this site in your browser settings, then tap Scan again.';
   const messages = {
-    NotAllowedError: 'Camera access was blocked. Allow the camera for this site in your browser settings, then tap Scan again.',
-    SecurityError: 'Camera access was blocked. Allow the camera for this site in your browser settings, then tap Scan again.',
+    NotAllowedError: blocked,
+    SecurityError: blocked,
     NotFoundError: 'No camera was found on this device.',
     OverconstrainedError: 'No camera was found on this device.',
     NotReadableError: 'The camera is being used by another app. Close it and tap Scan again.',
@@ -820,6 +830,13 @@ function closeHelp() {
   els.help.hidden = true;
   els.helpOpen.focus();
 }
+
+/** The Android app's back button: close the help sheet first. */
+window.cameraDetectorBack = () => {
+  if (els.help.hidden) return false;
+  closeHelp();
+  return true;
+};
 
 /* ── Wiring ────────────────────────────────────────────────── */
 
@@ -895,7 +912,11 @@ setView(state.view);
 updateUI();
 requestAnimationFrame(render);
 
-if ('serviceWorker' in navigator && location.protocol === 'https:') {
+if (android) {
+  // Already an app: hide "get the app" links. No offline cache needed either,
+  // since the files are bundled inside the app.
+  for (const el of document.querySelectorAll('.web-only')) el.hidden = true;
+} else if ('serviceWorker' in navigator && location.protocol === 'https:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 
