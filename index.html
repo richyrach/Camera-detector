@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#07090c" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="Find hidden camera lenses with your phone — even with the lights on." />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <title>Camera Detector</title>
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="icons/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="icons/icon-192.png" />
+    <link rel="stylesheet" href="styles.css" />
+    <script type="module" src="js/app.js"></script>
+  </head>
+  <body>
+    <main class="app">
+      <section id="stage" class="stage" data-view="normal">
+        <video id="video" playsinline muted autoplay></video>
+        <div class="red-tint" aria-hidden="true"></div>
+        <canvas id="overlay" class="overlay" aria-hidden="true"></canvas>
+      </section>
+
+      <header class="topbar">
+        <div id="status" class="status" data-mode="idle">
+          <span class="dot" aria-hidden="true"></span>
+          <span id="status-text">Ready</span>
+        </div>
+        <button id="help-open" class="icon-btn" type="button" aria-label="How it works and settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9.5" /><path d="M9.4 9.3a2.7 2.7 0 0 1 5.2 1c0 1.8-2.6 2.3-2.6 3.9" /><circle class="fill" cx="12" cy="17.2" r="1.1" /></svg>
+        </button>
+      </header>
+
+      <div class="notices">
+        <p id="count" class="count" aria-live="polite" hidden></p>
+        <p id="hint" class="hint" hidden></p>
+      </div>
+
+      <footer class="dock">
+        <div class="segmented" role="radiogroup" aria-label="View">
+          <button type="button" role="radio" data-view="normal" aria-checked="true">Normal</button>
+          <button type="button" role="radio" data-view="red" aria-checked="false">Red filter</button>
+          <button type="button" role="radio" data-view="heat" aria-checked="false">Glow map</button>
+        </div>
+        <label class="slider">
+          <span>Sensitivity</span>
+          <input id="sensitivity" type="range" min="0" max="100" value="50" />
+        </label>
+        <div class="controls">
+          <button id="flip" class="round-btn" type="button" aria-label="Switch camera">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 11a7.5 7.5 0 0 1 13-4.6L19.5 8.5" /><path d="M19.5 4v4.5H15" /><path d="M19.5 13a7.5 7.5 0 0 1-13 4.6L4.5 15.5" /><path d="M4.5 20v-4.5H9" /></svg>
+          </button>
+          <button id="start" class="scan-btn" type="button" aria-pressed="false">
+            <span class="scan-btn__icon" aria-hidden="true"></span>
+            <span id="start-label" class="scan-btn__label">Scan</span>
+          </button>
+          <button id="snap" class="round-btn" type="button" aria-label="Save a snapshot">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8.5A1.5 1.5 0 0 1 5.5 7h2.2l1.5-2.2h5.6L16.3 7h2.2A1.5 1.5 0 0 1 20 8.5v9A1.5 1.5 0 0 1 18.5 19h-13A1.5 1.5 0 0 1 4 17.5z" /><circle cx="12" cy="12.8" r="3.4" /></svg>
+          </button>
+        </div>
+      </footer>
+
+      <section id="intro" class="intro" aria-labelledby="intro-title">
+        <div class="intro__inner">
+          <img class="intro__logo" src="icons/icon.svg" alt="" width="88" height="88" />
+          <h1 id="intro-title">Camera Detector</h1>
+          <p class="intro__tag">Find hidden camera lenses — even with the lights on.</p>
+          <ol class="steps">
+            <li><strong>Your flashlight blinks.</strong> About twice a second.</li>
+            <li><strong>Lenses blink back.</strong> A camera lens bounces light straight back at your phone. Room lights don't blink, so they cancel out.</li>
+            <li><strong>Sweep slowly.</strong> Red circles mark spots worth a closer look.</li>
+          </ol>
+          <button id="intro-start" class="primary-btn" type="button">Start scanning</button>
+          <p class="intro__fine">Runs entirely on your phone. No video leaves your device.</p>
+        </div>
+      </section>
+
+      <section id="help" class="sheet" role="dialog" aria-modal="true" aria-labelledby="help-title" hidden>
+        <div class="sheet__panel">
+          <div class="sheet__head">
+            <h2 id="help-title">How it works</h2>
+            <button id="help-close" class="icon-btn" type="button" aria-label="Close">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+            </button>
+          </div>
+          <div class="sheet__body">
+            <p>Camera lenses are <em>retroreflectors</em>: light going in bounces almost straight back to where it came from. Your flashlight sits right next to your camera, so a hidden lens lights up in your view far more than anything around it.</p>
+            <p><strong>Flash scan</strong> blinks the flashlight and compares frames with it on and off. Lamps and daylight look the same in both, so they cancel out — that's why it works with the lights on. What's left are tiny spots that flash in sync with your light.</p>
+
+            <h3>Settings</h3>
+            <label class="switch">
+              <input id="opt-flash" type="checkbox" checked />
+              <span class="switch__track" aria-hidden="true"></span>
+              <span class="switch__text">Blink flashlight <small>Best detection. Turn off if flashing lights bother you.</small></span>
+            </label>
+            <label class="switch">
+              <input id="opt-sound" type="checkbox" />
+              <span class="switch__track" aria-hidden="true"></span>
+              <span class="switch__text">Beep when something is found <small>Phones that support it also vibrate.</small></span>
+            </label>
+
+            <h3>Tips</h3>
+            <ul>
+              <li>Stand 1–3 m (3–10 ft) away and sweep slowly. Pause for a second on anything suspicious.</li>
+              <li>Check what faces the bed, shower, toilet and desk: smoke detectors, clocks, USB chargers, power strips, air vents, picture frames, mirrors, TV boxes, speakers, plants and stuffed toys.</li>
+              <li><strong>Glow map</strong> view shows exactly what reacted to your flash. <strong>Red filter</strong> makes small glints easier to spot by eye.</li>
+              <li>Walk up to anything flagged. A real lens looks like a tiny dark circle (often 1–3 mm) that glints when light hits it.</li>
+            </ul>
+
+            <h3>Night-vision check</h3>
+            <p>Many hidden cameras use infrared lights to see in the dark. Your eyes can't see them, but a phone camera can. Turn the room lights off, switch to the <strong>front camera</strong> (it often filters infrared less), and look for small purple or white glowing dots.</p>
+
+            <h3>Expect false alarms</h3>
+            <p>Glass, shiny screws, jewellery, screens, reflective tape and pets' eyes can all bounce light back. Always confirm with your own eyes.</p>
+
+            <h3>Limits</h3>
+            <p>No app can promise to find every camera. A lens behind tinted glass, pointed away from you, or hidden inside an object without line of sight won't glint. You can also look at the Wi-Fi network list for devices you don't recognise.</p>
+
+            <p class="fine">Flash scan needs a browser that lets websites control the flashlight (Chrome on Android does). Other browsers use <strong>Spot scan</strong>, which looks for tiny bright points — hold another light right beside the camera for best results.</p>
+          </div>
+        </div>
+      </section>
+
+      <div id="toast" class="toast" role="status" hidden></div>
+    </main>
+  </body>
+</html>
