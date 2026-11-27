@@ -1,6 +1,6 @@
 // Offline support. Network first, so updates show up straight away when
 // online; the cached copy is used only when there's no connection.
-const CACHE = 'camera-detector-v1';
+const CACHE = 'camera-detector-v2';
 const ASSETS = [
   './',
   './index.html',

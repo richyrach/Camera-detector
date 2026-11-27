@@ -20,14 +20,28 @@
  * than its surroundings, in a spot only a few pixels wide. That is what a
  * lens glint looks like.
  *
- * Phones are hand-held, so the picture shifts between frames. Before comparing,
- * the OFF frames are lined up with the ON frame, and each pixel is compared
- * with the brightest OFF pixel right next to it, so any leftover wobble can't
- * make an edge look like a new bright spot.
+ * Phones are hand-held, so the picture shifts, tilts and zooms a little
+ * between frames. Before comparing, movement is measured in patches across the
+ * frame and the OFF frames are warped to line up with the ON frame. Each pixel
+ * is then compared with the brightest OFF pixel right next to it, so leftover
+ * wobble can't make a bright detail look new.
+ *
+ * Real rooms are full of things that can still fool that comparison, so a spot
+ * only counts when:
+ *  - it was dark with the flash off and got several times brighter, far more
+ *    than the rest of the picture did (a lens is a dark hole until lit);
+ *  - it beats the strongest "vanishing" spot in the same frame. Hand shake and
+ *    moving screens make details appear *and* disappear in equal measure; a
+ *    flash glint only ever appears. So the worst vanishing spot sets the bar;
+ *  - it stands alone. A hidden camera is one glint. A patch of similar glints
+ *    is a glossy surface (a keyboard, a shiny tray), so the whole patch is
+ *    ignored.
  */
 
-/** Pixels analysed per frame. Parameters below are tuned for this size. */
-export const PIXEL_BUDGET = 640 * 360;
+/** Pixels analysed per frame. */
+export const PIXEL_BUDGET = 800 * 450;
+/** Pixel-sized parameters below are tuned for this size and scale with it. */
+const REFERENCE_PIXELS = 640 * 360;
 
 const lerp = (a, b, t) => a + (b - a) * t;
 const clamp01 = (t) => (t < 0 ? 0 : t > 1 ? 1 : t);
@@ -43,7 +57,7 @@ export function analysisSize(videoWidth, videoHeight, budget = PIXEL_BUDGET) {
 
 /** How much bigger than the reference size an analysis grid is (linear). */
 function sizeScale(w, h) {
-  return Math.sqrt((w * h) / PIXEL_BUDGET);
+  return Math.sqrt((w * h) / REFERENCE_PIXELS);
 }
 
 /**
@@ -119,6 +133,29 @@ export function medianAbs(map, { step = 2, mask = null, maskMin = 0, maxValue = 
   return maxValue;
 }
 
+/** Median of `map` (sampled), optionally only where `mask[i] > maskMin`. */
+export function median(map, { step = 2, mask = null, maskMin = 0, lo = -4, hi = 4, bins = 2048 } = {}) {
+  const hist = new Uint32Array(bins);
+  const scale = bins / (hi - lo);
+  let count = 0;
+  for (let i = 0; i < map.length; i += step) {
+    if (mask && !(mask[i] > maskMin)) continue;
+    let b = ((map[i] - lo) * scale) | 0;
+    if (b < 0) b = 0;
+    else if (b >= bins) b = bins - 1;
+    hist[b]++;
+    count++;
+  }
+  if (!count) return 0;
+  const half = count / 2;
+  let acc = 0;
+  for (let b = 0; b < bins; b++) {
+    acc += hist[b];
+    if (acc >= half) return lo + (b + 0.5) / scale;
+  }
+  return hi;
+}
+
 function isLocalMax(map, w, x, y, v) {
   for (let dy = -1; dy <= 1; dy++) {
     for (let dx = -1; dx <= 1; dx++) {
@@ -134,9 +171,11 @@ function isLocalMax(map, w, x, y, v) {
 
 /**
  * Local maxima at or above `threshold`, strongest first, at least `minDist`
- * apart. Returns [{x, y, v}] in integer pixel coordinates.
+ * apart. Returns [{x, y, v}] in integer pixel coordinates. With `accept`, each
+ * peak is passed through it (return a value to keep, or null to drop) before
+ * it counts toward `max`, so rejected peaks can't crowd out real ones.
  */
-export function findPeaks(map, w, h, threshold, { border = 2, minDist = 6, max = 16 } = {}) {
+export function findPeaks(map, w, h, threshold, { border = 2, minDist = 6, max = 16, accept = null } = {}) {
   const found = [];
   for (let y = border; y < h - border; y++) {
     const row = y * w;
@@ -148,11 +187,15 @@ export function findPeaks(map, w, h, threshold, { border = 2, minDist = 6, max =
   found.sort((a, b) => b.v - a.v);
   const kept = [];
   const minD2 = minDist * minDist;
+  const out = [];
   for (const p of found) {
-    if (kept.length >= max) break;
-    if (kept.every((k) => (k.x - p.x) ** 2 + (k.y - p.y) ** 2 >= minD2)) kept.push(p);
+    if (out.length >= max) break;
+    if (!kept.every((k) => (k.x - p.x) ** 2 + (k.y - p.y) ** 2 >= minD2)) continue;
+    kept.push(p);
+    const a = accept ? accept(p) : p;
+    if (a) out.push(a);
   }
-  return kept;
+  return out;
 }
 
 /**
@@ -270,43 +313,242 @@ export function bestShift(a, b, w, h, x0, y0, range, step = 1) {
   return { dx: bx, dy: by };
 }
 
-/** out(x, y) = src(x + dx, y + dy), repeating edge pixels. */
-function shiftInto(src, w, h, dx, dy, out) {
+/**
+ * Like bestShift, but for one rectangular patch, searching ±`range` around
+ * (x0, y0). Also returns how confident the match is (`weight`: how sharply the
+ * error rises away from the best shift; ~0 on a featureless patch) and refines
+ * the shift to a fraction of a pixel.
+ */
+function patchShift(a, b, w, h, px, py, pw, ph, x0, y0, range, step) {
+  const size = 2 * range + 1;
+  const costs = new Float64Array(size * size);
+  let best = Infinity;
+  let bi = -1;
+  for (let j = 0; j < size; j++) {
+    const dy = y0 - range + j;
+    for (let i = 0; i < size; i++) {
+      const dx = x0 - range + i;
+      const xs = Math.max(px, -dx);
+      const xe = Math.min(px + pw, w - dx);
+      const ys = Math.max(py, -dy);
+      const ye = Math.min(py + ph, h - dy);
+      let sum = 0;
+      let n = 0;
+      for (let y = ys; y < ye; y += step) {
+        const ra = y * w;
+        const rb = (y + dy) * w + dx;
+        for (let x = xs; x < xe; x += step) {
+          sum += Math.abs(a[ra + x] - b[rb + x]);
+          n++;
+        }
+      }
+      const cost = n > 16 ? sum / n : Infinity;
+      costs[j * size + i] = cost;
+      if (cost < best) {
+        best = cost;
+        bi = j * size + i;
+      }
+    }
+  }
+  if (bi < 0) return null;
+  const bx = bi % size;
+  const by = (bi / size) | 0;
+  let fx = 0;
+  let fy = 0;
+  let curve = 0;
+  if (bx > 0 && bx < size - 1) {
+    const l = costs[bi - 1];
+    const r = costs[bi + 1];
+    const d = l + r - 2 * best;
+    if (d > 1e-9 && Number.isFinite(d)) {
+      fx = Math.max(-0.5, Math.min(0.5, (l - r) / (2 * d)));
+      curve += d;
+    }
+  }
+  if (by > 0 && by < size - 1) {
+    const u = costs[bi - size];
+    const dn = costs[bi + size];
+    const d = u + dn - 2 * best;
+    if (d > 1e-9 && Number.isFinite(d)) {
+      fy = Math.max(-0.5, Math.min(0.5, (u - dn) / (2 * d)));
+      curve += d;
+    }
+  }
+  return { dx: x0 - range + bx + fx, dy: y0 - range + by + fy, weight: curve };
+}
+
+/**
+ * Least-squares fit of a smooth movement (shift + rotation + zoom + shear) to
+ * patch shifts: displacement(x, y) = (p0 + p1·u + p2·v, q0 + q1·u + q2·v)
+ * with u, v measured from the frame centre. Patches that disagree with the
+ * fit (a moving screen, something close to the camera) are dropped and the
+ * fit is redone. Falls back to a plain shift when there isn't enough detail.
+ */
+export function fitMotion(patches, w, h) {
+  const cx = w / 2;
+  const cy = h / 2;
+  let use = patches.filter((p) => p.weight > 0);
+  let model = null;
+  for (let round = 0; round < 3 && use.length; round++) {
+    model = solveAffine(use, cx, cy);
+    const resid = use.map((p) => {
+      const u = p.x - cx;
+      const v = p.y - cy;
+      return Math.hypot(model.p0 + model.p1 * u + model.p2 * v - p.dx, model.q0 + model.q1 * u + model.q2 * v - p.dy);
+    });
+    const keep = use.filter((p, i) => resid[i] < 1.2);
+    if (keep.length === use.length || keep.length < 4) break;
+    use = keep;
+  }
+  return model ?? { p0: 0, p1: 0, p2: 0, q0: 0, q1: 0, q2: 0 };
+}
+
+function solveAffine(pts, cx, cy) {
+  let sw = 0;
+  let su = 0;
+  let sv = 0;
+  let suu = 0;
+  let suv = 0;
+  let svv = 0;
+  let sx = 0;
+  let sxu = 0;
+  let sxv = 0;
+  let sy = 0;
+  let syu = 0;
+  let syv = 0;
+  for (const p of pts) {
+    const k = p.weight;
+    const u = p.x - cx;
+    const v = p.y - cy;
+    sw += k;
+    su += k * u;
+    sv += k * v;
+    suu += k * u * u;
+    suv += k * u * v;
+    svv += k * v * v;
+    sx += k * p.dx;
+    sxu += k * p.dx * u;
+    sxv += k * p.dx * v;
+    sy += k * p.dy;
+    syu += k * p.dy * u;
+    syv += k * p.dy * v;
+  }
+  const shift = { p0: sx / sw, p1: 0, p2: 0, q0: sy / sw, q1: 0, q2: 0 };
+  if (pts.length < 4) return shift;
+  // Normal equations [sw su sv; su suu suv; sv suv svv] · [c0 c1 c2] = rhs.
+  // A small ridge keeps rotation/zoom near zero when the detail is all in one line.
+  const ridge = 1e-3 * (suu + svv) + 1e-9;
+  const m = [
+    [sw, su, sv],
+    [su, suu + ridge, suv],
+    [sv, suv, svv + ridge],
+  ];
+  const det =
+    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+    m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+    m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+  if (!(Math.abs(det) > 1e-9 * sw * (suu + 1) * (svv + 1))) return shift;
+  const solve = (r0, r1, r2) => {
+    const d = (a, b, c) =>
+      a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0]);
+    const col = [
+      [m[0][0], m[1][0], m[2][0]],
+      [m[0][1], m[1][1], m[2][1]],
+      [m[0][2], m[1][2], m[2][2]],
+    ];
+    const rhs = [r0, r1, r2];
+    return [d(rhs, col[1], col[2]) / det, d(col[0], rhs, col[2]) / det, d(col[0], col[1], rhs) / det];
+  };
+  const [p0, p1, p2] = solve(sx, sxu, sxv);
+  const [q0, q1, q2] = solve(sy, syu, syv);
+  // Hand shake between two frames is small; anything wild is a bad fit.
+  if (Math.abs(p1) > 0.05 || Math.abs(p2) > 0.05 || Math.abs(q1) > 0.05 || Math.abs(q2) > 0.05) return shift;
+  return { p0, p1, p2, q0, q1, q2 };
+}
+
+/**
+ * out(x, y) = src at (x, y) + displacement, nearest pixel, edges repeated.
+ * Nearest-pixel sampling keeps small details sharp (interpolating would blur
+ * them and make them look dimmer than in the ON frame). The ≤½-pixel rounding
+ * error is absorbed by the max filter afterwards.
+ */
+function warpInto(src, w, h, m, out) {
+  const cx = w / 2;
+  const cy = h / 2;
   for (let y = 0; y < h; y++) {
-    let sy = y + dy;
-    sy = sy < 0 ? 0 : sy >= h ? h - 1 : sy;
+    const v = y - cy;
     const ro = y * w;
-    const rs = sy * w;
     for (let x = 0; x < w; x++) {
-      let sx = x + dx;
+      const u = x - cx;
+      let sx = Math.round(x + m.p0 + m.p1 * u + m.p2 * v);
+      let sy = Math.round(y + m.q0 + m.q1 * u + m.q2 * v);
       sx = sx < 0 ? 0 : sx >= w ? w - 1 : sx;
-      out[ro + x] = src[rs + sx];
+      sy = sy < 0 ? 0 : sy >= h ? h - 1 : sy;
+      out[ro + x] = src[sy * w + sx];
     }
   }
 }
 
-/** 3×3 maximum filter ("dilate"). */
-function dilate3(src, w, h, out, tmp) {
+/** Largest displacement anywhere in the frame (for a safe border). */
+function maxDisplacement(m, w, h) {
+  let best = 0;
+  for (const [u, v] of [
+    [-w / 2, -h / 2],
+    [w / 2, -h / 2],
+    [-w / 2, h / 2],
+    [w / 2, h / 2],
+  ]) {
+    best = Math.max(best, Math.abs(m.p0 + m.p1 * u + m.p2 * v), Math.abs(m.q0 + m.q1 * u + m.q2 * v));
+  }
+  return best;
+}
+
+/** Separable (2r+1)×(2r+1) maximum filter. */
+export function maxFilter(src, w, h, r, out, tmp) {
   for (let y = 0; y < h; y++) {
     const row = y * w;
     for (let x = 0; x < w; x++) {
-      const l = src[row + (x > 0 ? x - 1 : 0)];
-      const c = src[row + x];
-      const r = src[row + (x < w - 1 ? x + 1 : x)];
-      tmp[row + x] = l > c ? (l > r ? l : r) : c > r ? c : r;
+      let m = -Infinity;
+      const x0 = x - r < 0 ? 0 : x - r;
+      const x1 = x + r >= w ? w - 1 : x + r;
+      for (let k = x0; k <= x1; k++) if (src[row + k] > m) m = src[row + k];
+      tmp[row + x] = m;
     }
   }
-  for (let y = 0; y < h; y++) {
-    const up = (y > 0 ? y - 1 : 0) * w;
-    const row = y * w;
-    const dn = (y < h - 1 ? y + 1 : y) * w;
-    for (let x = 0; x < w; x++) {
-      const u = tmp[up + x];
-      const c = tmp[row + x];
-      const d = tmp[dn + x];
-      out[row + x] = u > c ? (u > d ? u : d) : c > d ? c : d;
+  for (let x = 0; x < w; x++) {
+    for (let y = 0; y < h; y++) {
+      let m = -Infinity;
+      const y0 = y - r < 0 ? 0 : y - r;
+      const y1 = y + r >= h ? h - 1 : y + r;
+      for (let k = y0; k <= y1; k++) if (tmp[k * w + x] > m) m = tmp[k * w + x];
+      out[y * w + x] = m;
     }
   }
+  return out;
+}
+
+/**
+ * Keeps spots at or above `threshold` that stand alone. A hidden camera is one
+ * glint; a patch of similar spots is a glossy surface or a keyboard's letters.
+ * `spots` must include weaker ones too, so crowding can be judged.
+ */
+function keepIsolated(spots, threshold, radius) {
+  const kept = [];
+  let crowded = 0;
+  const r2 = radius * radius;
+  for (const p of spots) {
+    if (p.v < threshold) continue;
+    let similar = 0;
+    let twin = false;
+    for (const q of spots) {
+      if (q === p || (q.x - p.x) ** 2 + (q.y - p.y) ** 2 >= r2) continue;
+      if (q.v >= p.v * 0.35) similar++;
+      if (q.v >= p.v * 0.6) twin = true;
+    }
+    if (similar >= 2 || twin) crowded++;
+    else kept.push({ x: p.x, y: p.y, strength: p.v / threshold });
+  }
+  return { kept, crowded };
 }
 
 const COARSE = 4;
@@ -326,24 +568,26 @@ export class FlashDetector {
     this.hatRadius = options.hatRadius ?? Math.max(4, Math.round(9 * s));
     /** Largest glint radius we expect; anything wider is not a pinhole lens. */
     this.spotRadius = options.spotRadius ?? Math.max(3, Math.round(5 * s));
+    /** Leftover misalignment (pixels) tolerated after lining frames up. Kept
+     *  small: a lens in a pale housing has very little dark around it. */
+    this.tolerance = options.tolerance ?? 1;
+    /** A glint with this many similar glints nearby is part of a glossy surface. */
+    this.crowdRadius = options.crowdRadius ?? Math.round(this.spotRadius * 14);
     /** Furthest the picture may move between two frames and still line up. */
     this.maxShift = options.maxShift ?? Math.max(4, Math.round(24 * s));
     const n = w * h;
-    /** How much more than its surroundings each pixel brightened (log ratio). */
-    this.ratio = new Float32Array(n);
-    /** How many brightness levels each pixel gained. */
-    this.gain = new Float32Array(n);
     /** Final per-pixel score; the "glow map" view draws this. */
     this.score = new Float32Array(n);
+    /** How much more than its surroundings each pixel brightened (log ratio). */
+    this.ratio = new Float32Array(n);
     this.threshold = Infinity;
-    /** Picture movement found by the last process() call, in pixels. */
-    this.motion = { before: { dx: 0, dy: 0 }, after: { dx: 0, dy: 0 } };
-    this._base = new Float32Array(n);
-    this._blur = new Float32Array(n);
-    this._tmp = new Float32Array(n);
-    this._tmp2 = new Float32Array(n);
-    this._hpOn = new Float32Array(n);
-    this._hpOff = new Float32Array(n);
+    /** Movement found by the last process() call (see fitMotion). */
+    this.motion = null;
+    /** Why candidates were dropped in the last call (for tuning). */
+    this.stats = {};
+    for (const k of ['_offB', '_offA', '_base', '_onMax', '_negScore', '_neg', '_gain', '_blur', '_tmp', '_hpOn', '_hpOff']) {
+      this[k] = new Float32Array(n);
+    }
     this._cw = Math.floor(w / COARSE);
     this._ch = Math.floor(h / COARSE);
     const cn = this._cw * this._ch;
@@ -363,65 +607,129 @@ export class FlashDetector {
     subtractLocalMean(hp, w, h, 4, this._blur, this._tmp);
   }
 
-  /** How far `off` has moved relative to the ON frame (coarse, then fine). */
-  _shiftTo(off) {
+  /** Movement of `off` relative to the ON frame: a coarse shift for the whole
+   *  frame, then a fine shift per patch, then one smooth fit through them. */
+  _motionTo(off) {
     const { w, h } = this;
     this._alignable(off, this._hpOff, this._cOff);
     const coarseRange = Math.ceil(this.maxShift / COARSE);
-    const c = bestShift(this._cOn, this._cOff, this._cw, this._ch, 0, 0, coarseRange);
-    return bestShift(this._hpOn, this._hpOff, w, h, c.dx * COARSE, c.dy * COARSE, COARSE - 1, 2);
+    const g = bestShift(this._cOn, this._cOff, this._cw, this._ch, 0, 0, coarseRange, 2);
+    const portrait = h > w;
+    const nx = portrait ? 4 : 6;
+    const ny = portrait ? 6 : 4;
+    const pw = Math.floor(w / nx);
+    const ph = Math.floor(h / ny);
+    const patches = [];
+    for (let j = 0; j < ny; j++) {
+      for (let i = 0; i < nx; i++) {
+        const r = patchShift(this._hpOn, this._hpOff, w, h, i * pw, j * ph, pw, ph, g.dx * COARSE, g.dy * COARSE, COARSE, 3);
+        if (r) patches.push({ x: i * pw + pw / 2, y: j * ph + ph / 2, ...r });
+      }
+    }
+    const m = fitMotion(patches, w, h);
+    if (!patches.some((p) => p.weight > 0)) {
+      m.p0 = g.dx * COARSE;
+      m.q0 = g.dy * COARSE;
+    }
+    return m;
   }
 
   process(on, offBefore, offAfter = offBefore) {
-    const { w, h, ratio, gain, score } = this;
+    const { w, h, ratio, score } = this;
+    const offB = this._offB;
+    const offA = this._offA;
     const base = this._base;
+    const onMax = this._onMax;
+    const neg = this._neg;
+    const negScore = this._negScore;
+    const gain = this._gain;
     const blur = this._blur;
     const tmp = this._tmp;
-    const tmp2 = this._tmp2;
     const n = w * h;
     const t = clamp01(this.sensitivity);
-    const minGain = lerp(32, 12, t); // brightness levels a glint must gain
-    const minRatio = lerp(0.55, 0.22, t); // ≈1.7× … 1.25× brighter than surroundings
-    const noiseK = lerp(12, 5, t);
+    const minGain = lerp(45, 18, t); // brightness levels a glint must gain
+    const minJump = lerp(1.25, 0.6, t); // must brighten ≈3.5× … 1.8× more than the scene did
+    const minRatio = lerp(0.65, 0.3, t); // and stand out from its surroundings
+    const noiseK = lerp(12, 6, t);
+    const r = this.tolerance;
 
-    // Line both OFF frames up with the ON frame, then take the brightest OFF
-    // value around each pixel as the "before" brightness.
+    // 1. Line the OFF frames up with the ON frame.
     this._alignable(on, this._hpOn, this._cOn);
-    const before = this._shiftTo(offBefore);
-    const after = offAfter === offBefore ? before : this._shiftTo(offAfter);
+    const before = this._motionTo(offBefore);
+    const after = offAfter === offBefore ? before : this._motionTo(offAfter);
     this.motion = { before, after };
-    shiftInto(offBefore, w, h, before.dx, before.dy, tmp2);
-    dilate3(tmp2, w, h, base, tmp);
-    shiftInto(offAfter, w, h, after.dx, after.dy, tmp2);
-    dilate3(tmp2, w, h, blur, tmp);
+    warpInto(offBefore, w, h, before, offB);
+    warpInto(offAfter, w, h, after, offA);
+
+    // 2. "Appeared": ON compared with the brightest aligned OFF pixel nearby.
+    maxFilter(offB, w, h, r, base, tmp);
+    maxFilter(offA, w, h, r, blur, tmp);
     for (let i = 0; i < n; i++) if (blur[i] > base[i]) base[i] = blur[i];
+    // "Vanished": the mirror image, OFF compared with the brightest ON pixel
+    // nearby. Flash glints never vanish, so these come only from movement,
+    // screens and camera processing: they show how noisy this frame is.
+    maxFilter(on, w, h, r, onMax, tmp);
+    for (let i = 0; i < n; i++) {
+      const b = base[i];
+      const off = offB[i] < offA[i] ? offB[i] : offA[i];
+      gain[i] = on[i] - b;
+      ratio[i] = Math.log((on[i] + 8) / (b + 8));
+      neg[i] = Math.log((off + 8) / (onMax[i] + 8));
+      negScore[i] = off - onMax[i]; // vanished brightness, in levels
+    }
+
+    // 3. How much the whole picture changed (exposure, the flash's general wash).
+    const typical = median(ratio, { mask: base, maskMin: 12 });
+    const typicalNeg = median(neg, { mask: onMax, maskMin: 12 });
+    // jump = how much more than typical each pixel brightened (kept in `blur`)
+    for (let i = 0; i < n; i++) blur[i] = ratio[i] - typical;
+    // Local excess over the surroundings.
+    subtractLocalMean(ratio, w, h, this.hatRadius, onMax, tmp);
+    const negJump = this._hpOff; // reuse as scratch
+    for (let i = 0; i < n; i++) negJump[i] = neg[i] - typicalNeg;
+    subtractLocalMean(neg, w, h, this.hatRadius, onMax, tmp);
+
+    const noise = medianAbs(ratio, { mask: base, maskMin: 24 });
+    let threshold = Math.max(minRatio, noise * noiseK);
 
     for (let i = 0; i < n; i++) {
-      gain[i] = on[i] - base[i];
-      ratio[i] = Math.log((on[i] + 8) / (base[i] + 8));
+      score[i] = gain[i] > minGain && blur[i] > minJump && ratio[i] > 0 ? ratio[i] : 0;
+      negScore[i] = negScore[i] > minGain && negJump[i] > minJump && neg[i] > 0 ? neg[i] : 0;
     }
-    // Remove the broad wash of the flash and any auto-exposure shift. (`gain`
-    // stays raw: it only guards against noise in near-black pixels, where a
-    // tiny change is a big ratio.)
-    subtractLocalMean(ratio, w, h, this.hatRadius, blur, tmp);
 
-    // Noise level, measured where the image is bright enough to be meaningful.
-    const noise = medianAbs(ratio, { mask: base, maskMin: 24 });
-    const threshold = Math.max(minRatio, noise * noiseK);
+    // Near the frame edges the warped frames have no real data.
+    const moved = Math.max(maxDisplacement(before, w, h), maxDisplacement(after, w, h));
+    const border = Math.max(2, Math.ceil(moved) + r + 2);
+    const minDist = this.spotRadius * 2;
 
-    for (let i = 0; i < n; i++) score[i] = gain[i] > minGain && ratio[i] > 0 ? ratio[i] : 0;
+    // 4. The strongest small "vanished" spot sets the bar for this frame.
+    let worstVanished = 0;
+    const vanished = findPeaks(negScore, w, h, threshold * 0.5, {
+      border,
+      minDist,
+      max: 1,
+      accept: (p) => (smallSpotCenter(neg, w, h, p.x, p.y, this.spotRadius, p.v * 0.5) ? p : null),
+    });
+    if (vanished.length) worstVanished = vanished[0].v;
+    const raised = worstVanished * 1.2 > threshold;
+    threshold = Math.max(threshold, worstVanished * 1.2);
 
-    // Near the frame edges the shifted frames have no real data.
-    const moved = Math.max(Math.abs(before.dx), Math.abs(before.dy), Math.abs(after.dx), Math.abs(after.dy));
-    const border = Math.max(2, moved + 2);
-    const peaks = [];
-    const candidates = findPeaks(score, w, h, threshold, { border, minDist: this.spotRadius * 2, max: 24 });
-    for (const p of candidates) {
-      // A pinhole lens is a small round spot. Lines and patches are not.
-      const c = smallSpotCenter(ratio, w, h, p.x, p.y, this.spotRadius, p.v * 0.5);
-      if (c) peaks.push({ x: c.x, y: c.y, strength: p.v / threshold });
-    }
+    // 5. Small round spots, including weaker ones (to judge crowding).
+    const spots = findPeaks(score, w, h, threshold * 0.35, {
+      border,
+      minDist,
+      max: 64,
+      accept: (p) => {
+        const c = smallSpotCenter(ratio, w, h, p.x, p.y, this.spotRadius, p.v * 0.5);
+        return c && { x: c.x, y: c.y, v: p.v };
+      },
+    });
+
+    // 6. Keep strong spots that stand alone.
+    const { kept: peaks, crowded } = keepIsolated(spots, threshold, this.crowdRadius);
+
     this.threshold = threshold;
+    this.stats = { threshold, typical, worstVanished, raisedByVanished: raised, spots: spots.length, crowded, kept: peaks.length };
     return { peaks, threshold, noise, motion: this.motion };
   }
 }
@@ -441,6 +749,7 @@ export class SpotDetector {
     this.sensitivity = options.sensitivity ?? 0.5;
     this.hatRadius = options.hatRadius ?? Math.max(4, Math.round(9 * s));
     this.spotRadius = options.spotRadius ?? Math.max(3, Math.round(5 * s));
+    this.crowdRadius = options.crowdRadius ?? Math.round(this.spotRadius * 14);
     const n = w * h;
     this.contrast = new Float32Array(n);
     this.score = new Float32Array(n);
@@ -466,25 +775,30 @@ export class SpotDetector {
       score[i] = frame[i] >= minBrightness && contrast[i] > 0 ? contrast[i] : 0;
     }
 
-    const peaks = [];
-    const candidates = findPeaks(score, w, h, threshold, { minDist: this.spotRadius * 2, max: 24 });
-    for (const p of candidates) {
-      const c = smallSpotCenter(contrast, w, h, p.x, p.y, this.spotRadius, p.v * 0.5);
-      if (c) peaks.push({ x: c.x, y: c.y, strength: p.v / threshold });
-    }
+    const spots = findPeaks(score, w, h, threshold * 0.35, {
+      minDist: this.spotRadius * 2,
+      max: 96,
+      accept: (p) => {
+        const c = smallSpotCenter(contrast, w, h, p.x, p.y, this.spotRadius, p.v * 0.5);
+        return c && { x: c.x, y: c.y, v: p.v };
+      },
+    });
+    const { kept: peaks, crowded } = keepIsolated(spots, threshold, this.crowdRadius);
     this.threshold = threshold;
+    this.stats = { threshold, noise, spots: spots.length, crowded, kept: peaks.length };
     return { peaks, threshold, noise };
   }
 }
 
 /**
  * Keeps detections steady across frames. A spot only counts as "confirmed"
- * after it shows up in the same place `confirmHits` times, which filters out
- * one-off flickers. It is dropped after `maxMisses` updates without a match.
+ * after it shows up in the same place `confirmHits` times within the last
+ * `window` updates, which filters out one-off flickers. It is dropped after
+ * `maxMisses` updates in a row without a match.
  */
 export class Tracker {
-  constructor({ matchRadius = 15, maxMisses = 2, confirmHits = 2, maxTracks = 12 } = {}) {
-    this.opts = { matchRadius, maxMisses, confirmHits, maxTracks };
+  constructor({ matchRadius = 15, maxMisses = 2, confirmHits = 2, window = Infinity, maxTracks = 12 } = {}) {
+    this.opts = { matchRadius, maxMisses, confirmHits, window, maxTracks };
     this.tracks = [];
     this.nextId = 1;
   }
@@ -495,7 +809,12 @@ export class Tracker {
 
   /** `peaks` should be sorted strongest first (as the detectors return them). */
   update(peaks) {
-    const { matchRadius, maxMisses, confirmHits, maxTracks } = this.opts;
+    const { matchRadius, maxMisses, confirmHits, window, maxTracks } = this.opts;
+    const remember = (t, hit) => {
+      t.recent.push(hit);
+      if (t.recent.length > window) t.recent.shift();
+      if (t.recent.filter(Boolean).length >= confirmHits) t.confirmed = true;
+    };
     const maxD2 = matchRadius * matchRadius;
     const unmatched = new Set(this.tracks);
     const born = [];
@@ -517,7 +836,7 @@ export class Tracker {
         best.hits++;
         best.misses = 0;
         best.strength = 0.5 * best.strength + 0.5 * p.strength;
-        if (best.hits >= confirmHits) best.confirmed = true;
+        remember(best, true);
       } else {
         born.push({
           id: this.nextId++,
@@ -527,10 +846,14 @@ export class Tracker {
           misses: 0,
           strength: p.strength,
           confirmed: confirmHits <= 1,
+          recent: [true],
         });
       }
     }
-    for (const t of unmatched) t.misses++;
+    for (const t of unmatched) {
+      t.misses++;
+      remember(t, false);
+    }
 
     let tracks = this.tracks.filter((t) => t.misses <= maxMisses).concat(born);
     if (tracks.length > maxTracks) {

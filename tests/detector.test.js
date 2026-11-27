@@ -5,11 +5,13 @@ import {
   SpotDetector,
   Tracker,
   analysisSize,
+  PIXEL_BUDGET,
   bestShift,
   boxBlur,
   brightnessFromRGBA,
   findPeaks,
 } from '../js/detector.js';
+import { roomTriple } from './room.js';
 
 const W = 320;
 const H = 180;
@@ -96,7 +98,7 @@ const near = (p, x, y, r = 3) => Math.hypot(p.x - x, p.y - y) <= r;
 test('analysisSize keeps aspect ratio and stays within budget', () => {
   const a = analysisSize(1280, 720);
   assert.ok(Math.abs(a.width / a.height - 16 / 9) < 0.01);
-  assert.ok(a.width * a.height <= 640 * 360 * 1.01);
+  assert.ok(a.width * a.height <= PIXEL_BUDGET * 1.01);
   const b = analysisSize(200, 100);
   assert.deepEqual(b, { width: 200, height: 100 }, 'never upscales');
 });
@@ -221,7 +223,7 @@ test('flash scan rejects a large reflective patch (a mirror or screen)', () => {
 test('higher sensitivity catches a fainter glint', () => {
   const off = room();
   const on = withFlash(room());
-  fillDisc(on, 240, 130, 1, 45); // a faint glint (distant lens)
+  fillDisc(on, 240, 130, 1, 70); // a fainter glint (distant lens)
   const low = new FlashDetector(W, H, { sensitivity: 0 }).process(on, off, off);
   const high = new FlashDetector(W, H, { sensitivity: 1 }).process(on, off, off);
   assert.equal(low.peaks.length, 0);
@@ -258,4 +260,85 @@ test('tracker confirms repeated spots and forgets vanished ones', () => {
   t = tr.update([]);
   t = tr.update([]);
   assert.equal(t.length, 0, 'both forgotten after too many misses');
+});
+
+// ── The realistic room (see room.js): keyboard, glossy keys, a laptop screen
+// playing video, an LED strip, hand shake and auto-exposure. ───────────────
+
+const RW = 480;
+const RH = 270;
+const onLens = (p, lens) => Math.hypot(p.x - lens.x, p.y - lens.y) < 4;
+
+test('room: finds the webcam and nothing else, steady or shaky', () => {
+  for (const [seed, shake, autoExposure] of [
+    [1, 0.5, true],
+    [2, 1.5, true],
+    [3, 4, true],
+    [4, 1.5, false],
+  ]) {
+    const r = roomTriple(RW, RH, { seed, shake, autoExposure });
+    const { peaks } = new FlashDetector(RW, RH).process(r.on, r.offBefore, r.offAfter);
+    const label = `seed ${seed} shake ${shake} AE ${autoExposure}`;
+    assert.ok(peaks.some((p) => onLens(p, r.lens)), `${label}: lens missed`);
+    assert.deepEqual(peaks.filter((p) => !onLens(p, r.lens)), [], `${label}: false alarms`);
+  }
+});
+
+test('room: no lens means no alarms, even at full sensitivity', () => {
+  for (const seed of [5, 6]) {
+    const r = roomTriple(RW, RH, { seed, shake: 2, lens: false });
+    const { peaks } = new FlashDetector(RW, RH, { sensitivity: 1 }).process(r.on, r.offBefore, r.offAfter);
+    assert.deepEqual(peaks, [], `seed ${seed}`);
+  }
+});
+
+test('room: a faint, distant lens is still found', () => {
+  const r = roomTriple(RW, RH, { seed: 7, shake: 1.5, glint: 0.5 });
+  const { peaks } = new FlashDetector(RW, RH).process(r.on, r.offBefore, r.offAfter);
+  assert.ok(peaks.some((p) => onLens(p, r.lens)), JSON.stringify(peaks));
+});
+
+test('room: big hand movement (tilt + zoom) is lined up', () => {
+  const r = roomTriple(RW, RH, { seed: 8, shake: 8, glossy: false });
+  const det = new FlashDetector(RW, RH);
+  const { peaks } = det.process(r.on, r.offBefore, r.offAfter);
+  assert.ok(Math.abs(det.motion.after.p0) > 8, 'should have measured the movement');
+  assert.ok(peaks.some((p) => onLens(p, r.lens)));
+  assert.equal(peaks.length, 1, JSON.stringify(peaks));
+});
+
+test('tracker can require hits in most of the recent updates', () => {
+  const tr = new Tracker({ matchRadius: 10, confirmHits: 3, window: 4, maxMisses: 2 });
+  const spot = [{ x: 50, y: 50, strength: 1 }];
+  tr.update(spot);
+  tr.update([]);
+  tr.update(spot);
+  assert.equal(tr.tracks[0].confirmed, false, '2 of 3 is not enough');
+  tr.update(spot);
+  assert.equal(tr.tracks[0].confirmed, true, '3 of the last 4');
+
+  const flicker = new Tracker({ matchRadius: 10, confirmHits: 3, window: 4, maxMisses: 2 });
+  for (const seen of [true, false, false, true, false, false, true]) flicker.update(seen ? spot : []);
+  assert.ok(flicker.tracks.every((t) => !t.confirmed), 'a spot seen 1 time in 3 never confirms');
+});
+
+test('findPeaks: rejected peaks do not use up the limit', () => {
+  const map = new Float32Array(W * H);
+  for (let i = 0; i < 10; i++) map[20 * W + 20 + i * 10] = 9; // strong but unwanted
+  map[100 * W + 200] = 2; // weaker, wanted
+  const wanted = (p) => (p.y === 100 ? p : null);
+  assert.deepEqual(
+    findPeaks(map, W, H, 1, { max: 3, accept: wanted }).map((p) => [p.x, p.y]),
+    [[200, 100]],
+  );
+});
+
+test('room: a lens with only a tiny dark rim (pale housing) is found', () => {
+  // In the portrait layout the lens sits on the pale wall, not in the bezel.
+  for (const seed of [3, 4]) {
+    const r = roomTriple(450, 800, { seed, shake: 2 });
+    const { peaks } = new FlashDetector(450, 800).process(r.on, r.offBefore, r.offAfter);
+    assert.ok(peaks.some((p) => onLens(p, r.lens)), `seed ${seed}: ${JSON.stringify(peaks)}`);
+    assert.equal(peaks.length, 1, JSON.stringify(peaks));
+  }
 });

@@ -201,21 +201,29 @@ public class MainActivity extends Activity {
         /** Saves a JPEG snapshot to Pictures/Camera Detector. */
         @JavascriptInterface
         public boolean saveImage(String base64Jpeg, String fileName) {
+            return saveFile(base64Jpeg, fileName, "image/jpeg");
+        }
+
+        /** Saves a JPEG or PNG image to Pictures/Camera Detector. */
+        @JavascriptInterface
+        public boolean saveFile(String base64, String fileName, String mimeType) {
+            String mime = "image/png".equals(mimeType) ? "image/png" : "image/jpeg";
+            String ext = mime.equals("image/png") ? ".png" : ".jpg";
             String name = fileName == null ? "" : fileName.replaceAll("[^A-Za-z0-9._-]", "_");
             if (name.isEmpty()) name = "camera-scan";
-            if (!name.endsWith(".jpg")) name += ".jpg";
+            if (!name.endsWith(ext)) name += ext;
 
             ContentResolver resolver = getContentResolver();
             ContentValues values = new ContentValues();
             values.put(MediaStore.Images.Media.DISPLAY_NAME, name);
-            values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+            values.put(MediaStore.Images.Media.MIME_TYPE, mime);
             values.put(MediaStore.Images.Media.RELATIVE_PATH,
                     Environment.DIRECTORY_PICTURES + "/Camera Detector");
             values.put(MediaStore.Images.Media.IS_PENDING, 1);
 
             Uri uri = null;
             try {
-                byte[] bytes = Base64.decode(base64Jpeg, Base64.DEFAULT);
+                byte[] bytes = Base64.decode(base64, Base64.DEFAULT);
                 uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
                 if (uri == null) return false;
                 try (OutputStream out = resolver.openOutputStream(uri)) {

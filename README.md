@@ -14,8 +14,12 @@ A camera lens is a **retroreflector**: light that goes into it bounces almost st
 
 - **Room lighting cancels out.** Lamps, windows and daylight are the same in both frames, so they don't show up.
 - **Surface texture cancels out.** Frames are compared as a *ratio*. A white wall and a grey wall both get brighter by the same factor when the flash hits them; a lens glint gets brighter by a far bigger factor.
-- **Hand shake cancels out.** The flash-off frames are lined up with the flash-on frame before comparing, and each pixel is compared with the brightest flash-off pixel right next to it.
-- **Only small round spots count.** Lines, edges and big shiny patches (mirrors, screens) are rejected, and a spot has to show up in the same place on consecutive blinks before it's flagged.
+- **Hand shake cancels out.** Movement is measured in patches across the picture (shift, tilt and zoom), the flash-off frames are warped to line up with the flash-on frame, and each pixel is compared with the brightest flash-off pixel right next to it.
+- **A lens is dark until lit.** A spot has to get several times brighter with the flash, far more than the rest of the picture. Already-bright details like key letters or screen pixels can't do that.
+- **Movement can't fake it.** Hand shake and moving screens make details appear *and* disappear. A flash glint only ever appears. The strongest "disappearing" spot in each frame sets the bar that a real glint has to beat.
+- **Lone glints only.** A hidden camera is one glint. A patch of similar glints is a glossy surface (keyboards, shiny trays) and is ignored.
+- **Only small round spots count, and they must repeat.** Lines, edges and big shiny patches (mirrors, screens) are rejected, and a spot has to blink back on 3 of the last 4 flashes before it's flagged.
+- **Exposure is locked while scanning** on phones that allow it, so the camera doesn't re-adjust every time the flash fires.
 
 What's left gets a red **Possible lens** marker.
 
@@ -52,7 +56,7 @@ The app checks what your browser supports and picks the right mode automatically
 
 Because the app isn't from the Play Store, Play Protect may warn that it doesn't recognise the developer. That's expected for apps you install yourself.
 
-Needs Android 10 or newer. Release 1.0.0, signing certificate SHA-256: `70:04:14:5a:99:e0:8c:35:50:bb:ab:d6:be:49:84:15:c3:e3:d0:76:01:85:e6:84:7e:87:22:f0:15:fe:79:57`.
+Needs Android 10 or newer. Release 1.1.0, signing certificate SHA-256: `70:04:14:5a:99:e0:8c:35:50:bb:ab:d6:be:49:84:15:c3:e3:d0:76:01:85:e6:84:7e:87:22:f0:15:fe:79:57`.
 
 ### Website (any phone)
 
@@ -102,7 +106,7 @@ npm test           # unit tests for the detection maths (Node 18+)
 npm run test:e2e   # full app in headless Chromium with a simulated camera + flashlight
 ```
 
-The end-to-end test fakes a phone camera showing a lit room with an always-on lamp and a small object hiding a lens that only glints while the app has the flashlight on, with simulated hand shake. It checks that Flash scan finds the lens, ignores the lamp and raises no false alarms, that Spot scan works without flashlight control, and that the flashlight is off after stopping. It also checks the Android app's hooks (native snapshot saving, back button, no "download the app" link inside the app). It uses Playwright (`npm i -D playwright` if it isn't installed).
+The end-to-end test fakes a phone camera showing a lit room with an always-on lamp and a small object hiding a lens that only glints while the app has the flashlight on, with simulated hand shake. It checks that Flash scan finds the lens, ignores the lamp and raises no false alarms, that Spot scan works without flashlight control, and that the flashlight is off after stopping. It also runs a laptop keyboard with glossy keys, an LED strip and phone auto-exposure fighting the flash, and checks the Android app's hooks (native snapshot saving, back button, no "download the app" link inside the app). It uses Playwright (`npm i -D playwright` if it isn't installed).
 
 ## Project layout
 
@@ -118,6 +122,10 @@ tests/                unit + end-to-end tests, local dev server
 android/              Android app (WebView wrapper around the web app)
 downloads/            the built APK
 ```
+
+## Help tune it
+
+If it flags the wrong things or misses a camera, open the **?** sheet during a Flash scan and tap **Save test capture**. It saves the last flash-off, flash-on and flash-off frames side by side as one PNG, exactly as the detector saw them. Those can be replayed through `js/detector.js` to tune it on real phones.
 
 ## Limits
 

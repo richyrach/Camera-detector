@@ -4,7 +4,7 @@ import { FlashDetector, SpotDetector, Tracker, analysisSize, brightnessFromRGBA 
  *  phase lasts at least this long, which also caps the blink rate at
  *  ~2.5 flashes per second, below the range most likely to affect people
  *  with photosensitivity. */
-const SETTLE_MS = 200;
+const SETTLE_MS = 250;
 /** Spot scan (no flashlight control) analyses about 9 frames per second. */
 const SPOT_INTERVAL_MS = 110;
 /** Never wait longer than this for a new video frame. */
@@ -34,6 +34,7 @@ const els = {
   helpClose: $('help-close'),
   optFlash: $('opt-flash'),
   optSound: $('opt-sound'),
+  saveCapture: $('save-capture'),
   toast: $('toast'),
 };
 const viewButtons = [...document.querySelectorAll('[data-view]')].filter((b) => b.tagName === 'BUTTON');
@@ -60,6 +61,11 @@ const state = {
   allowFlash: prefs.flash !== false,
   analysis: null,
   tracker: new Tracker(),
+  /** Exposure/white balance held steady while flash scanning (if supported). */
+  lock: null,
+  lockLevel: 0,
+  /** The last OFF/ON/OFF frames, for "Save test capture". */
+  lastCapture: null,
   tracks: [],
   announced: new Set(),
   heatReady: false,
@@ -251,12 +257,72 @@ function setTorch(on) {
       return;
     }
     if (state.torch === on || (on && !state.torchSupported)) return;
-    await track.applyConstraints({ advanced: [{ torch: on }] });
+    // Repeat the exposure lock with every flash change: some browsers reset
+    // settings that aren't mentioned.
+    await track.applyConstraints({ advanced: [{ torch: on, ...(state.lock ?? {}) }] });
+    const reported = track.getSettings?.().torch;
+    if (state.lock && typeof reported === 'boolean' && reported !== on) {
+      // The browser ignored the combined request: drop the lock, keep the flash.
+      state.lock = null;
+      await track.applyConstraints({ advanced: [{ torch: on }] });
+    }
     state.torch = on;
   };
   const result = torchQueue.then(apply, apply);
   torchQueue = result.catch(() => {});
   return result;
+}
+
+/**
+ * Hold exposure and white balance where they are, so the camera doesn't
+ * re-adjust every time the flash fires (that makes ordinary details look like
+ * they lit up). Only on phones and browsers that support it; otherwise the
+ * detector copes without.
+ */
+async function lockExposure(level) {
+  const track = state.track;
+  if (!track?.getCapabilities) return;
+  const caps = track.getCapabilities() ?? {};
+  const now = track.getSettings?.() ?? {};
+  const lock = {};
+  if (caps.exposureMode?.includes?.('manual') && typeof now.exposureTime === 'number') {
+    lock.exposureMode = 'manual';
+    lock.exposureTime = now.exposureTime;
+    if (caps.iso && typeof now.iso === 'number') lock.iso = now.iso;
+  }
+  if (caps.whiteBalanceMode?.includes?.('manual') && typeof now.colorTemperature === 'number') {
+    lock.whiteBalanceMode = 'manual';
+    lock.colorTemperature = now.colorTemperature;
+  }
+  if (!Object.keys(lock).length) return;
+  try {
+    await track.applyConstraints({ advanced: [{ torch: false, ...lock }] });
+    state.lock = lock;
+    state.lockLevel = level;
+  } catch {
+    state.lock = null;
+  }
+}
+
+async function unlockExposure() {
+  const lock = state.lock;
+  state.lock = null;
+  if (!lock || state.track?.readyState !== 'live') return;
+  const auto = {};
+  if (lock.exposureMode) auto.exposureMode = 'continuous';
+  if (lock.whiteBalanceMode) auto.whiteBalanceMode = 'continuous';
+  await state.track.applyConstraints({ advanced: [{ torch: state.torch, ...auto }] }).catch(() => {});
+}
+
+/** Average brightness of a frame (sampled). */
+function meanLevel(buf) {
+  let sum = 0;
+  let n = 0;
+  for (let i = 0; i < buf.length; i += 61) {
+    sum += buf[i];
+    n++;
+  }
+  return n ? sum / n : 0;
 }
 
 /* ── Analysis buffers ──────────────────────────────────────── */
@@ -291,6 +357,8 @@ function setupAnalysis() {
     heatCanvas,
     heatCtx,
     heatImage: heatCtx.createImageData(W, H),
+    /** Latest colour frame behind each brightness buffer. */
+    rgba: new Map(),
   };
   state.tracks = [];
   state.heatReady = false;
@@ -298,7 +366,9 @@ function setupAnalysis() {
 
 function grab(A, out) {
   A.ctx.drawImage(els.video, 0, 0, A.W, A.H);
-  brightnessFromRGBA(A.ctx.getImageData(0, 0, A.W, A.H).data, out);
+  const img = A.ctx.getImageData(0, 0, A.W, A.H);
+  A.rgba.set(out, img);
+  brightnessFromRGBA(img.data, out);
 }
 
 /* ── Scanning ──────────────────────────────────────────────── */
@@ -327,10 +397,12 @@ async function startScan() {
   const mode = state.torchSupported && state.allowFlash ? 'flash' : 'spot';
   const A = state.analysis;
   const radius = A.flash.spotRadius * 3;
+  // Flash scan: a spot must show up on 3 of the last 4 flashes.
   state.tracker =
     mode === 'flash'
-      ? new Tracker({ matchRadius: radius, confirmHits: 2, maxMisses: 2 })
+      ? new Tracker({ matchRadius: radius, confirmHits: 3, window: 4, maxMisses: 2 })
       : new Tracker({ matchRadius: radius, confirmHits: 3, maxMisses: 4 });
+  state.lastCapture = null;
   state.mode = mode;
   state.running = true;
   state.tracks = [];
@@ -352,6 +424,7 @@ async function stopScan() {
   releaseWakeLock();
   updateUI();
   await setTorch(false).catch(() => {});
+  await unlockExposure();
 }
 
 /**
@@ -377,6 +450,7 @@ async function flashLoop(id) {
         if (!alive() || A !== state.analysis) continue;
         grab(A, A.offA);
         prevOff = A.offA;
+        if (!state.lock) await lockExposure(meanLevel(A.offA));
       }
       await setTorch(true);
       await sleep(SETTLE_MS);
@@ -393,7 +467,19 @@ async function flashLoop(id) {
 
       A.flash.sensitivity = state.sensitivity;
       handleResult(A, A.flash.process(A.on, prevOff, off), A.flash);
+      state.lastCapture = { W: A.W, H: A.H, frames: [A.rgba.get(prevOff), A.rgba.get(A.on), A.rgba.get(off)] };
       prevOff = off;
+
+      // Pointed somewhere much brighter or darker since exposure was locked:
+      // let the camera re-adjust, then lock again.
+      if (state.lock) {
+        const level = meanLevel(off);
+        if (level > state.lockLevel * 2.2 || level < state.lockLevel / 2.2 || level > 235) {
+          await unlockExposure();
+          await sleep(700);
+          prevOff = null;
+        }
+      }
     }
   } catch (err) {
     console.warn('Flash scan stopped:', err);
@@ -402,6 +488,7 @@ async function flashLoop(id) {
       await setTorch(false).catch(() => {});
       toast("Couldn't control the flashlight, so switched to Spot scan.");
       state.mode = 'spot';
+      await unlockExposure();
       state.tracker = new Tracker({ matchRadius: state.analysis.spot.spotRadius * 3, confirmHits: 3, maxMisses: 4 });
       state.tracks = [];
       updateUI();
@@ -566,8 +653,10 @@ function render(now) {
     const topmost = !els.hint.hidden ? els.hint : !els.count.hidden ? els.count : els.status;
     T.labelTop = topmost.getBoundingClientRect().bottom + 6;
   }
-  for (const t of state.tracks) if (!t.confirmed) drawMarker(ctx, T, t, now);
-  for (const t of state.tracks) if (t.confirmed) drawMarker(ctx, T, t, now);
+  for (const t of state.tracks) if (!t.confirmed) drawMarker(ctx, T, t, now, false);
+  // Strongest first; only the strongest gets a label, to keep the view readable.
+  const confirmed = state.tracks.filter((t) => t.confirmed).sort((a, b) => b.strength - a.strength);
+  confirmed.slice(0, 4).forEach((t, i) => drawMarker(ctx, T, t, now, i === 0));
 }
 
 function drawSweep(ctx, cw, ch, now) {
@@ -582,7 +671,7 @@ function drawSweep(ctx, cw, ch, now) {
   ctx.fillRect(0, y - 1, cw, 1);
 }
 
-function drawMarker(ctx, T, t, now) {
+function drawMarker(ctx, T, t, now, withLabel) {
   const { x, y } = toScreen(T, t.x, t.y);
   if (!t.confirmed) {
     ctx.save();
@@ -626,6 +715,7 @@ function drawMarker(ctx, T, t, now) {
   ctx.stroke();
   ctx.restore();
 
+  if (!withLabel) return;
   const label = state.mode === 'flash' ? 'Possible lens' : 'Bright spot';
   ctx.save();
   ctx.font = '700 12px system-ui, -apple-system, sans-serif';
@@ -712,6 +802,11 @@ async function snapshot() {
       if (err?.name === 'AbortError') return;
     }
   }
+  downloadBlob(blob, name);
+  toast('Snapshot saved.');
+}
+
+function downloadBlob(blob, name) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -720,7 +815,37 @@ async function snapshot() {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 10000);
-  toast('Snapshot saved.');
+}
+
+/**
+ * Saves the last flash-OFF, flash-ON and flash-OFF frames side by side as one
+ * lossless PNG, exactly as the detector saw them, so a missed camera or a
+ * false alarm can be reproduced and tuned for.
+ */
+async function saveCapture() {
+  const cap = state.lastCapture;
+  if (!cap || cap.frames.some((f) => !f)) {
+    toast('Start a Flash scan first, then try again.');
+    return;
+  }
+  const c = document.createElement('canvas');
+  c.width = cap.W * 3;
+  c.height = cap.H;
+  const ctx = c.getContext('2d');
+  cap.frames.forEach((img, i) => ctx.putImageData(img, i * cap.W, 0));
+  const name = `camera-detector-test-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.png`;
+  if (android?.saveFile) {
+    const ok = android.saveFile(c.toDataURL('image/png').split(',')[1], name, 'image/png');
+    toast(ok ? 'Test capture saved to Photos.' : "Couldn't save the test capture.");
+    return;
+  }
+  const blob = await new Promise((resolve) => c.toBlob(resolve, 'image/png'));
+  if (!blob) {
+    toast("Couldn't save the test capture.");
+    return;
+  }
+  downloadBlob(blob, name);
+  toast('Test capture saved to Downloads.');
 }
 
 /* ── UI state ──────────────────────────────────────────────── */
@@ -852,6 +977,7 @@ els.start.addEventListener('click', () => {
 });
 
 els.flip.addEventListener('click', flipCamera);
+els.saveCapture.addEventListener('click', saveCapture);
 els.snap.addEventListener('click', snapshot);
 
 for (const b of viewButtons) b.addEventListener('click', () => setView(b.dataset.view));
@@ -931,6 +1057,9 @@ Object.defineProperty(window, '__cameraDetector', {
         torch: state.torch,
         torchSupported: state.torchSupported,
         status: els.statusText.textContent,
+        locked: Boolean(state.lock),
+        stats: state.mode && A ? { ...(state.mode === 'flash' ? A.flash : A.spot).stats } : null,
+        hasCapture: Boolean(state.lastCapture),
         tracks: A
           ? state.tracks.map((t) => ({ x: (t.x + 0.5) / A.W, y: (t.y + 0.5) / A.H, confirmed: t.confirmed, hits: t.hits }))
           : [],
